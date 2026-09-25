@@ -330,6 +330,11 @@ export default function App() {
     engine.onEnded = () => {
       previewRef.current = null;
       setPlaying(false);
+      // 自然结束：界面播放头同步到本次播放的真实终点（完整播放 / 处理后
+      // 试听为当前缓冲末尾，章节 / 命中等限时试听为本次片段终点）——引擎
+      // 已在结束事件中把内部时钟停在该处。手动暂停与跳转不经过此回调，
+      // 各自保留当时位置。
+      setPlayhead(engine.getTime());
       setAuditioning((a) => {
         if (a) {
           engine.setPlaybackBuffer(null);

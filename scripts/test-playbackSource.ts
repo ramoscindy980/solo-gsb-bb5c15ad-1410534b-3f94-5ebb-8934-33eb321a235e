@@ -9,7 +9,11 @@ import { AudioEngine, StaleDecodeError } from '../src/audio/AudioEngine';
  * - 主播放从处理后试听切回原声时按 getTime() 保留当前播放位置；
  * - 共用定位链路（波形空白点击 / 章节跳转）按操作前的播放状态处理：
  *   先读 playing 再拆旧音源，播放中定位从目标秒数继续播放原声，
- *   暂停时定位不启动新音源。
+ *   暂停时定位不启动新音源；
+ * - 自然结束定位：完整播放 / 处理后试听至尾端时内部时钟停在该缓冲的
+ *   真实终点（而非起播点），章节 / 命中等限时试听停在本次片段终点，
+ *   播放中读数不越过自然终点；被新播放取代的旧结束事件与手动暂停
+ *   触发的结束事件都不得改写位置、不得触发 onEnded。
  */
 
 let failures = 0;
@@ -60,15 +64,21 @@ class FakeSourceNode {
   onended: (() => void) | null = null;
   startWhen = -1;
   startOffset = -1;
+  startDuration: number | null = null;
   stopped = false;
   connect() {}
   disconnect() {}
-  start(when = 0, offset = 0) {
+  start(when = 0, offset = 0, duration?: number) {
     this.startWhen = when;
     this.startOffset = offset;
+    this.startDuration = duration ?? null;
   }
   stop() {
     this.stopped = true;
+  }
+  /** 模拟浏览器在音源自然播完 / 被 stop() 后异步派发的结束事件 */
+  fireEnded() {
+    this.onended?.();
   }
 }
 
@@ -321,6 +331,100 @@ async function main() {
       same(ctx.sources.length, sourcesBefore, '暂停时定位：不创建新音源');
       ok(!engine.playing, '暂停时定位：定位后保持暂停');
     }
+    engine.dispose();
+  }
+
+  // ---- 场景 7：自然结束定位 —— 内部时钟停在本次播放的真实终点 ----
+  {
+    const engine = new AudioEngine();
+    const ctx = engine.getContext() as unknown as FakeAudioContext;
+    const orig = buf('原始', 100);
+    const processed = buf('处理后', 80);
+    ctx.autoDecodeQueue = [orig];
+    await engine.decode(fakeFile());
+
+    let ended = 0;
+    let endedAt = -1;
+    engine.onEnded = () => {
+      ended++;
+      endedAt = engine.getTime(); // App 在 onEnded 里以此同步界面播放头
+    };
+
+    // 7a：从任意位置完整播放至尾端 → 停在缓冲真实终点，而非起播点
+    engine.play(30);
+    ctx.currentTime = 70; // 30 + 70 = 100，恰好播到末尾
+    ctx.lastSource().fireEnded();
+    approx(engine.getTime(), 100, 1e-9, '完整播放自然结束：内部时间停在缓冲终点');
+    approx(endedAt, 100, 1e-9, '完整播放自然结束：onEnded 时界面可同步到缓冲终点');
+    same(ended, 1, '完整播放自然结束：onEnded 触发一次');
+    ok(!engine.playing, '自然结束后不再处于播放态');
+
+    // 7b：处理后试听至尾端 → 停在处理后缓冲的真实终点
+    engine.setPlaybackBuffer(asAudioBuffer(processed));
+    engine.play(70);
+    ctx.currentTime = 80; // 70 + (80-70) = 播到处理后缓冲末尾
+    ctx.lastSource().fireEnded();
+    approx(engine.getTime(), 80, 1e-9, '处理后试听至尾端：停在该缓冲真实终点');
+    approx(endedAt, 80, 1e-9, '处理后试听至尾端：onEnded 时界面同步到该缓冲终点');
+    same(ended, 2, '处理后试听结束：onEnded 再触发一次');
+    engine.setPlaybackBuffer(null);
+
+    // 7c：章节 / 命中等限时试听 → 停在本次片段终点
+    engine.play(10, 20);
+    approx(ctx.lastSource().startDuration ?? -1, 10, 1e-9, '限时试听：音源带片段时长启动');
+    ctx.currentTime = 90; // 10 + (90-80) = 20，播到片段终点
+    ctx.lastSource().fireEnded();
+    approx(engine.getTime(), 20, 1e-9, '限时试听自然结束：停在本次片段终点');
+    approx(endedAt, 20, 1e-9, '限时试听自然结束：onEnded 时界面同步到片段终点');
+    same(ended, 3, '限时试听结束：onEnded 再触发一次');
+
+    // 7d：播放中读数不越过自然终点（onended 派发前的帧也不超读）
+    engine.play(95);
+    ctx.currentTime = 120; // 95 + (120-90) 远超缓冲末尾
+    approx(engine.getTime(), 100, 1e-9, '播放中读数被钳制在自然终点');
+    engine.dispose();
+  }
+
+  // ---- 场景 8：旧结束事件 / 手动暂停的结束事件不得改写位置 ----
+  {
+    const engine = new AudioEngine();
+    const ctx = engine.getContext() as unknown as FakeAudioContext;
+    const orig = buf('原始', 100);
+    ctx.autoDecodeQueue = [orig];
+    await engine.decode(fakeFile());
+
+    let ended = 0;
+    engine.onEnded = () => {
+      ended++;
+    };
+
+    // 8a：被新播放取代的旧音源，其结束事件不得改写新播放的位置与状态
+    engine.play(10);
+    const oldSrc = ctx.lastSource();
+    engine.play(40); // 取代旧音源（旧音源被 stop，浏览器随后异步派发其 onended）
+    ctx.currentTime = 1;
+    oldSrc.fireEnded();
+    ok(engine.playing, '旧结束事件不影响新播放的播放态');
+    approx(engine.getTime(), 41, 1e-9, '旧结束事件不改写新播放的位置');
+    same(ended, 0, '旧结束事件不触发 onEnded');
+
+    // 8b：手动暂停保留当时位置，暂停引发的结束事件不得改写、不得触发 onEnded
+    ctx.currentTime = 6; // 40 + (6-0) = 46
+    const pausedAt = engine.pause();
+    approx(pausedAt, 46, 1e-9, '手动暂停：返回当时位置');
+    approx(engine.getTime(), 46, 1e-9, '手动暂停：内部时钟停在当时位置');
+    oldSrc.fireEnded(); // 旧音源补发（幂等）
+    ctx.sources[ctx.sources.length - 1].fireEnded(); // 被暂停 stop 的音源派发 onended
+    approx(engine.getTime(), 46, 1e-9, '手动暂停的结束事件不改写位置');
+    same(ended, 0, '手动暂停不触发 onEnded');
+
+    // 8c：暂停后从当时位置继续播放，自然结束仍停在缓冲终点
+    engine.play(engine.getTime());
+    approx(ctx.lastSource().startOffset, 46, 1e-9, '暂停后继续播放：从当时位置起播');
+    ctx.currentTime = 60; // 46 + (60-6) = 100
+    ctx.lastSource().fireEnded();
+    approx(engine.getTime(), 100, 1e-9, '继续播放至尾端：停在缓冲终点');
+    same(ended, 1, '继续播放自然结束：onEnded 触发一次');
     engine.dispose();
   }
 

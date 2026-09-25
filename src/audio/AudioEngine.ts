@@ -27,6 +27,12 @@ export class AudioEngine {
   /** buffer offset at which playback started */
   private offset = 0;
   /**
+   * buffer time at which the current playback ends naturally: the segment
+   * end for ranged previews, otherwise the end of the played buffer.
+   * Computed once in play() so the clock and the ended handler agree.
+   */
+  private endAt = 0;
+  /**
    * buffer currently being played (defaults to the decoded source buffer).
    * Ownership is explicit: auditioning a processed result sets this, leaving
    * the audition (or any main-playback / preview action) clears it, and every
@@ -81,7 +87,9 @@ export class AudioEngine {
   getTime(): number {
     if (!this.playing || !this.ctx) return this.offset;
     const t = this.offset + (this.ctx.currentTime - this.startedAt);
-    return Math.min(t, this.playbackBuffer?.duration ?? this.duration);
+    // Never read past the natural end of the current playback, not even in
+    // the frames before the source's ended event is delivered.
+    return Math.min(t, this.endAt);
   }
 
   /**
@@ -115,6 +123,9 @@ export class AudioEngine {
     this.offset = start;
     this.stopAt = to !== undefined ? Math.min(to, dur) : null;
     const segLen = Math.max(0, (this.stopAt ?? dur) - start);
+    // The source only honours stopAt when it lies past the start (mirrors
+    // the start() branch below); otherwise it plays to the buffer's end.
+    this.endAt = this.stopAt !== null && this.stopAt > start ? this.stopAt : dur;
     const t0 = ctx.currentTime;
 
     // Fade envelope: a dedicated GainNode per preview, fitted to the actual
@@ -136,10 +147,18 @@ export class AudioEngine {
 
     source.onended = () => {
       // onended also fires on manual stop(); only the CURRENT source may
-      // change state — a superseded source's event must be ignored.
+      // change state — a superseded source's event must be ignored, so an
+      // old ended event can never rewrite the position of a newer playback.
       if (this.source !== source || !this.playing) return;
       this.playing = false;
-      this.offset = this.stopAt ?? this.offset;
+      // Natural end: park the internal clock at the TRUE end of this
+      // playback — the segment end for ranged previews, the buffer end for
+      // full playback / processed-buffer auditions — never back at the
+      // start offset. Manual pause/seek never reach this handler and keep
+      // their own position.
+      this.offset = this.endAt;
+      this.stopAt = null;
+      this.source = null;
       this.clearTimer();
       this.clearEnvelope();
       this.onEnded?.();
