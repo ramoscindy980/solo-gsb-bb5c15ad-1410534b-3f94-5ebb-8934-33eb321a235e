@@ -29,12 +29,13 @@ export class AudioEngine {
   /**
    * buffer currently being played (defaults to the decoded source buffer).
    * Ownership is explicit: auditioning a processed result sets this, leaving
-   * the audition (or any main-playback / preview action) clears it, and every
-   * successful decode() resets it so the newest file always owns playback.
+   * the audition (manual stop, any main-playback / preview action, or the
+   * audition playing to its natural end) clears it, and every successful
+   * decode() resets it so the newest file always owns playback.
    */
   private playbackBuffer: AudioBuffer | null = null;
+  /** end position of the current run: segment end for timed previews, null for full playback */
   private stopAt: number | null = null;
-  private stopTimer: number | null = null;
   playing = false;
   onEnded: (() => void) | null = null;
 
@@ -114,7 +115,11 @@ export class AudioEngine {
     const start = Math.max(0, Math.min(from, dur));
     this.offset = start;
     this.stopAt = to !== undefined ? Math.min(to, dur) : null;
-    const segLen = Math.max(0, (this.stopAt ?? dur) - start);
+    // The run's true landing point, captured for THIS source: the buffer end
+    // for full playback (incl. processed-buffer auditions, which are the
+    // same length) or the segment end for timed previews (chapters / hits).
+    const endAt = this.stopAt ?? dur;
+    const segLen = Math.max(0, endAt - start);
     const t0 = ctx.currentTime;
 
     // Fade envelope: a dedicated GainNode per preview, fitted to the actual
@@ -135,13 +140,25 @@ export class AudioEngine {
     }
 
     source.onended = () => {
-      // onended also fires on manual stop(); only the CURRENT source may
-      // change state — a superseded source's event must be ignored.
+      // onended also fires when a manual stop() / newer play() tears the
+      // source down. Only the CURRENT source's NATURAL end may change state;
+      // endAt is captured per source, so a superseded source's stale event
+      // (this.source !== source or playing already false) is ignored and can
+      // never rewrite the new run's position.
       if (this.source !== source || !this.playing) return;
       this.playing = false;
-      this.offset = this.stopAt ?? this.offset;
-      this.clearTimer();
+      // Full playback lands on the buffer's true end (previously the offset
+      // stayed at the start point, snapping the clock back); timed previews
+      // land on this run's segment end instead.
+      this.offset = endAt;
       this.clearEnvelope();
+      // A processed-buffer audition running to its end naturally leaves the
+      // audition: ownership returns to the decoded source buffer, matching
+      // the manual-stop path (stopAudition / stop()).
+      if (this.playbackBuffer !== null && target === this.playbackBuffer) {
+        this.playbackBuffer = null;
+      }
+      this.stopAt = null;
       this.onEnded?.();
     };
 
@@ -165,7 +182,6 @@ export class AudioEngine {
   stop(): void {
     this.playing = false;
     this.stopSource();
-    this.clearTimer();
   }
 
   private stopSource(): void {
@@ -194,13 +210,6 @@ export class AudioEngine {
         /* ignore */
       }
       e.disconnect();
-    }
-  }
-
-  private clearTimer(): void {
-    if (this.stopTimer !== null) {
-      window.clearTimeout(this.stopTimer);
-      this.stopTimer = null;
     }
   }
 

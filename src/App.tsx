@@ -328,22 +328,15 @@ export default function App() {
   // playback clock
   useEffect(() => {
     engine.onEnded = () => {
+      // 自然播放结束（非手动暂停 / 被新播放取代）：引擎内部时间已停在本次
+      // 播放的真实终点（完整播放为缓冲尾端、限时试听为片段终点），这里把
+      // 同一位置同步给界面播放头，避免播完后播放头跳回起播点或停在尾端前。
       previewRef.current = null;
+      setPlayhead(engine.getTime());
       setPlaying(false);
-      setAuditioning((a) => {
-        if (a) {
-          engine.setPlaybackBuffer(null);
-          return false;
-        }
-        return a;
-      });
-      setClickAuditioning((a) => {
-        if (a) {
-          engine.setPlaybackBuffer(null);
-          return false;
-        }
-        return a;
-      });
+      // 处理后试听播到尾端：引擎已自动把播放源切回原始缓冲，仅同步界面态
+      setAuditioning(false);
+      setClickAuditioning(false);
     };
     let raf = 0;
     const tick = () => {
